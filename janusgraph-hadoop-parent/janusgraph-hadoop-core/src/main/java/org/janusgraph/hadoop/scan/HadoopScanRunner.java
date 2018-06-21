@@ -16,7 +16,6 @@ package org.janusgraph.hadoop.scan;
 
 import com.google.common.base.Preconditions;
 import org.janusgraph.diskstorage.configuration.*;
-import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanJob;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanMetrics;
 import org.janusgraph.graphdb.olap.VertexScanJob;
@@ -103,9 +102,11 @@ public class HadoopScanRunner {
                     JanusGraphHadoopConfiguration.SCAN_JOB_CONFIG_KEYS, scanConf);
 
             // Copy scanjob settings from the JanusGraph Configuration instance to the Hadoop Configuration instance
-            Map<String, Object> jobConfMap = conf.getSubset(confRoot);
-            for (Map.Entry<String, Object> jobConfEntry : jobConfMap.entrySet()) {
-                hadoopJobConf.set((ConfigOption) ConfigElement.parse(confRoot, jobConfEntry.getKey()).element, jobConfEntry.getValue());
+            if (conf != null) {
+                Map<String, Object> jobConfMap = conf.getSubset(confRoot);
+                for (Map.Entry<String, Object> jobConfEntry : jobConfMap.entrySet()) {
+                    hadoopJobConf.set((ConfigOption) ConfigElement.parse(confRoot, jobConfEntry.getKey()).element, jobConfEntry.getValue());
+                }
             }
         }
 

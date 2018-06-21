@@ -25,9 +25,15 @@ import static org.janusgraph.diskstorage.cql.CQLConfigOptions.BATCH_STATEMENT_SI
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.CLUSTER_NAME;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.ONLY_USE_LOCAL_CONSISTENCY_FOR_SYSTEM_OPERATIONS;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.KEYSPACE;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.LOCAL_CORE_CONNECTIONS_PER_HOST;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.LOCAL_DATACENTER;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.LOCAL_MAX_CONNECTIONS_PER_HOST;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.LOCAL_MAX_REQUESTS_PER_CONNECTION;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.PROTOCOL_VERSION;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.READ_CONSISTENCY;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.REMOTE_CORE_CONNECTIONS_PER_HOST;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.REMOTE_MAX_CONNECTIONS_PER_HOST;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.REMOTE_MAX_REQUESTS_PER_CONNECTION;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.REPLICATION_FACTOR;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.REPLICATION_OPTIONS;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.REPLICATION_STRATEGY;
@@ -43,6 +49,7 @@ import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.DR
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.METRICS_PREFIX;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.METRICS_SYSTEM_PREFIX_DEFAULT;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.buildGraphConfiguration;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GRAPH_NAME;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -60,6 +67,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
+import javax.annotation.Resource;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
@@ -84,8 +92,10 @@ import com.datastax.driver.core.BatchStatement;
 import com.datastax.driver.core.BatchStatement.Type;
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.Cluster.Builder;
+import com.datastax.driver.core.HostDistance;
 import com.datastax.driver.core.JdkSSLOptions;
 import com.datastax.driver.core.KeyspaceMetadata;
+import com.datastax.driver.core.PoolingOptions;
 import com.datastax.driver.core.ProtocolVersion;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Session;
@@ -101,12 +111,15 @@ import io.vavr.collection.Iterator;
 import io.vavr.collection.Seq;
 import io.vavr.concurrent.Future;
 import io.vavr.control.Option;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * This class creates {@see CQLKeyColumnValueStore}s and handles Cassandra-backed allocation of vertex IDs for JanusGraph (when so
  * configured).
  */
 public class CQLStoreManager extends DistributedStoreManager implements KeyColumnValueStoreManager {
+    private static final Logger LOGGER = LoggerFactory.getLogger(CQLStoreManager.class);
 
     static final String CONSISTENCY_LOCAL_QUORUM = "LOCAL_QUORUM";
     static final String CONSISTENCY_QUORUM = "QUORUM";
@@ -119,7 +132,8 @@ public class CQLStoreManager extends DistributedStoreManager implements KeyColum
 
     final ExecutorService executorService;
 
-    private final Cluster cluster;
+    @Resource
+    private Cluster cluster;
     private final Session session;
     private final StoreFeatures storeFeatures;
     private final Map<String, CQLKeyColumnValueStore> openStores;
@@ -130,7 +144,7 @@ public class CQLStoreManager extends DistributedStoreManager implements KeyColum
      */
     public CQLStoreManager(final Configuration configuration) throws BackendException {
         super(configuration, DEFAULT_PORT);
-        this.keyspace = configuration.get(KEYSPACE);
+        this.keyspace = determineKeyspaceName(configuration);
         this.batchSize = configuration.get(BATCH_STATEMENT_SIZE);
         this.atomicBatch = configuration.get(ATOMIC_BATCH_MUTATE);
 
@@ -247,21 +261,46 @@ public class CQLStoreManager extends DistributedStoreManager implements KeyColum
             }
         }
 
-        return builder.build();
+        // Build the PoolingOptions based on the configurations
+        PoolingOptions poolingOptions = new PoolingOptions();
+        poolingOptions
+            .setMaxRequestsPerConnection(
+                    HostDistance.LOCAL,
+                    configuration.get(LOCAL_MAX_REQUESTS_PER_CONNECTION))
+            .setMaxRequestsPerConnection(
+                    HostDistance.REMOTE,
+                    configuration.get(REMOTE_MAX_REQUESTS_PER_CONNECTION));
+        poolingOptions
+            .setConnectionsPerHost(
+                    HostDistance.LOCAL,
+                    configuration.get(LOCAL_CORE_CONNECTIONS_PER_HOST),
+                    configuration.get(LOCAL_MAX_CONNECTIONS_PER_HOST))
+            .setConnectionsPerHost(
+                    HostDistance.REMOTE,
+                    configuration.get(REMOTE_CORE_CONNECTIONS_PER_HOST),
+                    configuration.get(REMOTE_MAX_CONNECTIONS_PER_HOST));
+        return builder.withPoolingOptions(poolingOptions).build();
     }
 
     Session initializeSession(final String keyspaceName) {
-        final Configuration configuration = getStorageConfig();
-        final Map<String, Object> replication = Match(configuration.get(REPLICATION_STRATEGY)).of(
-                Case($("SimpleStrategy"), strategy -> HashMap.<String, Object> of("class", strategy, "replication_factor", configuration.get(REPLICATION_FACTOR))),
-                Case($("NetworkTopologyStrategy"),
-                        strategy -> HashMap.<String, Object> of("class", strategy)
-                                .merge(Array.of(configuration.get(REPLICATION_OPTIONS))
-                                        .grouped(2)
-                                        .toMap(array -> Tuple.of(array.get(0), Integer.parseInt(array.get(1)))))))
-                .toJavaMap();
-
         final Session s = this.cluster.connect();
+
+        // if the keyspace already exists, just return the session
+        if (this.cluster.getMetadata().getKeyspace(keyspaceName) != null) {
+            return s;
+        }
+
+        final Configuration configuration = getStorageConfig();
+        // Setting replication strategy based on value reading from the configuration: either "SimpleStrategy" or "NetworkTopologyStrategy"
+        final Map<String, Object> replication = Match(configuration.get(REPLICATION_STRATEGY)).of(
+            Case($("SimpleStrategy"), strategy -> HashMap.<String, Object> of("class", strategy, "replication_factor", configuration.get(REPLICATION_FACTOR))),
+            Case($("NetworkTopologyStrategy"),
+                strategy -> HashMap.<String, Object> of("class", strategy)
+                    .merge(Array.of(configuration.get(REPLICATION_OPTIONS))
+                        .grouped(2)
+                        .toMap(array -> Tuple.of(array.get(0), Integer.parseInt(array.get(1)))))))
+            .toJavaMap();
+
         s.execute(createKeyspace(keyspaceName)
                 .ifNotExists()
                 .with()
@@ -331,11 +370,13 @@ public class CQLStoreManager extends DistributedStoreManager implements KeyColum
     public void clearStorage() throws BackendException {
         if (this.storageConfig.get(DROP_ON_CLEAR)) {
             this.session.execute(dropKeyspace(this.keyspace));
-        } else {
+        } else if (this.exists()) {
             final Future<Seq<ResultSet>> result = Future.sequence(
                 Iterator.ofAll(this.cluster.getMetadata().getKeyspace(this.keyspace).getTables())
                     .map(table -> Future.fromJavaFuture(this.session.executeAsync(truncate(this.keyspace, table.getName())))));
             result.await();
+        } else {
+            LOGGER.info("Keyspace {} does not exist in the cluster", this.keyspace);
         }
     }
 
@@ -392,7 +433,7 @@ public class CQLStoreManager extends DistributedStoreManager implements KeyColum
         sleepAfterWrite(txh, commitTime);
     }
 
-    // Create an async unlogged batch per partition key
+    // Create an async un-logged batch per partition key
     private void mutateManyUnlogged(final Map<String, Map<StaticBuffer, KCVMutation>> mutations, final StoreTransaction txh) throws BackendException {
         final MaskedTimestamp commitTime = new MaskedTimestamp(txh);
 
@@ -426,5 +467,10 @@ public class CQLStoreManager extends DistributedStoreManager implements KeyColum
             throw EXCEPTION_MAPPER.apply(result.getCause().get());
         }
         sleepAfterWrite(txh, commitTime);
+    }
+
+    private String determineKeyspaceName(Configuration config) {
+        if ((!config.has(KEYSPACE) && (config.has(GRAPH_NAME)))) return config.get(GRAPH_NAME);
+        return config.get(KEYSPACE);
     }
 }

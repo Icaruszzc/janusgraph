@@ -44,6 +44,7 @@ public abstract class AbstractCassandraStoreTest extends KeyColumnValueStoreTest
     private static final String DEFAULT_COMPRESSOR_PACKAGE = "org.apache.cassandra.io.compress";
 
     public abstract ModifiableConfiguration getBaseStorageConfiguration();
+    public abstract ModifiableConfiguration getBaseStorageConfiguration(String keyspace);
 
     public abstract AbstractCassandraStoreManager openStorageManager(Configuration c) throws BackendException;
 
@@ -101,12 +102,12 @@ public abstract class AbstractCassandraStoreTest extends KeyColumnValueStoreTest
     @Test
     public void testCustomCFCompressor() throws BackendException {
 
-        final String cname = "DeflateCompressor";
+        final String compressor = "DeflateCompressor";
         final int ckb = 128;
         final String cf = TEST_CF_NAME + "_gzip";
 
         ModifiableConfiguration config = getBaseStorageConfiguration();
-        config.set(AbstractCassandraStoreManager.CF_COMPRESSION_TYPE,cname);
+        config.set(AbstractCassandraStoreManager.CF_COMPRESSION_TYPE,compressor);
         config.set(AbstractCassandraStoreManager.CF_COMPRESSION_BLOCK_SIZE,ckb);
 
         AbstractCassandraStoreManager mgr = openStorageManager(config);
@@ -117,7 +118,7 @@ public abstract class AbstractCassandraStoreTest extends KeyColumnValueStoreTest
         final Map<String, String> expected = ImmutableMap
                 .<String, String> builder()
                 .put("sstable_compression",
-                        DEFAULT_COMPRESSOR_PACKAGE + "." + cname)
+                        DEFAULT_COMPRESSOR_PACKAGE + "." + compressor)
                 .put("chunk_length_kb", String.valueOf(ckb)).build();
 
         assertEquals(expected, mgr.getCompressionOptions(cf));
@@ -139,9 +140,24 @@ public abstract class AbstractCassandraStoreTest extends KeyColumnValueStoreTest
     }
 
     @Test
-    public void testTTLSupported() throws Exception {
+    public void testTTLSupported() {
         StoreFeatures features = manager.getFeatures();
         assertTrue(features.hasCellTTL());
+    }
+
+    @Test
+    public void keyspaceShouldBeEquivalentToProvidedOne() throws BackendException {
+        final ModifiableConfiguration config = getBaseStorageConfiguration("randomNewKeyspace");
+        final AbstractCassandraStoreManager mgr = openStorageManager(config);
+        assertEquals("randomNewKeyspace", mgr.keySpaceName);
+    }
+
+    @Test
+    public void keyspaceShouldBeEquivalentToGraphName() throws BackendException {
+        final ModifiableConfiguration config = getBaseStorageConfiguration(null);
+        config.set(GraphDatabaseConfiguration.GRAPH_NAME, "randomNewGraphName");
+        final AbstractCassandraStoreManager mgr = openStorageManager(config);
+        assertEquals("randomNewGraphName", mgr.keySpaceName);
     }
 
     @Override

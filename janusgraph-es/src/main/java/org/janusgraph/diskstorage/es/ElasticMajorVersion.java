@@ -14,6 +14,9 @@
 
 package org.janusgraph.diskstorage.es;
 
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 public enum ElasticMajorVersion {
 
     ONE(1),
@@ -26,7 +29,9 @@ public enum ElasticMajorVersion {
 
     ;
 
-    int value;
+    static final Pattern PATTERN = Pattern.compile("(\\d+)\\.\\d+\\.\\d+.*");
+
+    final int value;
 
     ElasticMajorVersion(int value) {
         this.value = value;
@@ -34,5 +39,21 @@ public enum ElasticMajorVersion {
 
     public int getValue() {
         return value;
+    }
+
+    public static ElasticMajorVersion parse(final String value) {
+        final Matcher m = value != null ? PATTERN.matcher(value) : null;
+        switch (m != null && m.find() ? Integer.valueOf(m.group(1)) : -1) {
+            case 1:
+                return ElasticMajorVersion.ONE;
+            case 2:
+                return ElasticMajorVersion.TWO;
+            case 5:
+                return ElasticMajorVersion.FIVE;
+            case 6:
+                return ElasticMajorVersion.SIX;
+            default:
+                throw new IllegalArgumentException("Unsupported Elasticsearch server major version: " + value);
+        }
     }
 }
